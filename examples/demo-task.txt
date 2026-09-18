@@ -1,0 +1,6 @@
+Process the employee reimbursement claim through the enterprise Windows desktop.
+Connect through the configured VPN provider and RDP, read the reimbursement
+instructions and the invoice in the INVOICES folder, enter the claim in the
+legacy accounting application, submit/approve/pay it, and verify the resulting
+accounting posting. Use the credential vault and MFA tools if authentication is
+required. Do not expose secrets in chat.
