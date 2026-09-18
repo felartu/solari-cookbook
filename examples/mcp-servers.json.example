@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "enterprise-vpn": {
+      "command": "bash",
+      "args": ["/absolute/path/to/solari-enterprise-vdi-toolkit/scripts/run-vpn-mcp.sh"]
+    },
+    "enterprise-secrets-mfa": {
+      "command": "bash",
+      "args": ["/absolute/path/to/solari-enterprise-vdi-toolkit/scripts/run-security-mcp.sh"]
+    }
+  }
+}

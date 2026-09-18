@@ -1,0 +1,12 @@
+/build/
+/dist/
+*.log
+*.pid
+*.key
+*.psk
+.env
+.env.*
+!.env.example
+secrets/
+__pycache__/
+*.pyc

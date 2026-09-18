@@ -1,0 +1,406 @@
+diff -ruN vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_ipsec.c vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_ipsec.c
+--- vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_ipsec.c	2025-11-07 19:05:36.000000000 +0000
++++ vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_ipsec.c	2026-09-05 22:27:24.063176079 +0000
+@@ -61,6 +61,11 @@
+ 	 * Whether UDP encapsulation is required
+ 	 */
+ 	bool require_encap;
++
++	/**
++	 * Skip all host route installation for the no-TUN dataplane.
++	 */
++	bool no_tun;
+ };
+ 
+ typedef struct exclude_route_t exclude_route_t;
+@@ -410,7 +415,7 @@
+ 	host_t *src_ip;
+ 	bool is_virtual;
+ 
+-	if (policy->direction != POLICY_OUT)
++	if (this->no_tun || policy->direction != POLICY_OUT)
+ 	{
+ 		this->mutex->unlock(this->mutex);
+ 		return TRUE;
+@@ -717,6 +722,8 @@
+ 		.allow_peer_ts = lib->settings->get_bool(lib->settings,
+ 					"%s.plugins.kernel-libipsec.allow_peer_ts", FALSE, lib->ns),
+ 		.require_encap = !lib->get(lib, "kernel-libipsec-esp-handler"),
++		.no_tun = lib->settings->get_bool(lib->settings,
++									 "%s.plugins.kernel-libipsec.no_tun", FALSE, lib->ns),
+ 	);
+ 
+ 	ipsec->events->register_listener(ipsec->events, &this->ipsec_listener);
+diff -ruN vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
+--- vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c	2025-11-07 19:05:36.000000000 +0000
++++ vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c	2026-09-05 22:27:24.062835744 +0000
+@@ -51,6 +51,11 @@
+ 	 * Raw ESP handler
+ 	 */
+ 	kernel_libipsec_esp_handler_t *esp_handler;
++
++	/**
++	 * Use the userspace packet socket instead of a TUN device.
++	 */
++	bool no_tun;
+ };
+ 
+ METHOD(plugin_t, get_name, char*,
+@@ -113,11 +118,14 @@
+ PLUGIN_DEFINE(kernel_libipsec)
+ {
+ 	private_kernel_libipsec_plugin_t *this;
++	bool no_tun;
+ 
+-	if (!lib->caps->check(lib->caps, CAP_NET_ADMIN))
++	no_tun = lib->settings->get_bool(lib->settings,
++									 "%s.plugins.kernel-libipsec.no_tun", FALSE, lib->ns);
++	if (!no_tun && !lib->caps->check(lib->caps, CAP_NET_ADMIN))
+ 	{	/* required to create TUN devices */
+ 		DBG1(DBG_KNL, "kernel-libipsec plugin requires CAP_NET_ADMIN "
+-			 "capability");
++			 "capability unless no_tun is enabled");
+ 		return NULL;
+ 	}
+ 
+@@ -129,6 +137,7 @@
+ 				.destroy = _destroy,
+ 			},
+ 		},
++		.no_tun = no_tun,
+ 	);
+ 
+ 	if (!libipsec_init())
+@@ -138,25 +147,35 @@
+ 		return NULL;
+ 	}
+ 
+-	this->tun = tun_device_create("ipsec%d");
+-	if (!this->tun)
++	if (this->no_tun)
+ 	{
+-		DBG1(DBG_KNL, "failed to create TUN device");
+-		destroy(this);
+-		return NULL;
++		/* The negotiated VIP exists only inside the userspace dataplane. */
++		lib->settings->set_bool(lib->settings, "%s.install_virtual_ip",
++								FALSE, lib->ns);
++		DBG1(DBG_KNL, "kernel-libipsec no-TUN packet mode enabled");
+ 	}
+-	if (!this->tun->set_mtu(this->tun, TUN_DEFAULT_MTU) ||
+-		!this->tun->up(this->tun))
++	else
+ 	{
+-		DBG1(DBG_KNL, "failed to configure TUN device");
+-		destroy(this);
+-		return NULL;
++		this->tun = tun_device_create("ipsec%d");
++		if (!this->tun)
++		{
++			DBG1(DBG_KNL, "failed to create TUN device");
++			destroy(this);
++			return NULL;
++		}
++		if (!this->tun->set_mtu(this->tun, TUN_DEFAULT_MTU) ||
++			!this->tun->up(this->tun))
++		{
++			DBG1(DBG_KNL, "failed to configure TUN device");
++			destroy(this);
++			return NULL;
++		}
++		lib->set(lib, "kernel-libipsec-tun", this->tun);
++
++		/* set TUN device as default to install VIPs */
++		lib->settings->set_str(lib->settings, "%s.install_virtual_ip_on",
++							   this->tun->get_name(this->tun), lib->ns);
+ 	}
+-	lib->set(lib, "kernel-libipsec-tun", this->tun);
+-
+-	/* set TUN device as default to install VIPs */
+-	lib->settings->set_str(lib->settings, "%s.install_virtual_ip_on",
+-						   this->tun->get_name(this->tun), lib->ns);
+ 
+ 	if (lib->settings->get_bool(lib->settings,
+ 						"%s.plugins.kernel-libipsec.raw_esp", FALSE, lib->ns))
+diff -ruN vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c
+--- vendor/strongswan-6.0.7/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c	2025-11-07 19:05:36.000000000 +0000
++++ vendor/strongswan-6.0.7-notun/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c	2026-09-05 22:27:24.063503011 +0000
+@@ -16,6 +16,10 @@
+ 
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <errno.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
+ 
+ #include "kernel_libipsec_router.h"
+ #include "kernel_libipsec_esp_handler.h"
+@@ -82,6 +86,20 @@
+ 	 * ESP handler to send raw ESP packets
+ 	 */
+ 	kernel_libipsec_esp_handler_t *esp_handler;
++
++	/** Userspace packet-socket mode (no TUN). */
++	bool no_tun;
++
++	/** Bound AF_UNIX/SOCK_DGRAM socket for cleartext IP packets. */
++	int packet_fd;
++
++	/** Path of packet socket, owned. */
++	char *packet_path;
++
++	/** Last registered datagram peer (the userspace TCP/IP side). */
++	struct sockaddr_un packet_peer;
++	socklen_t packet_peer_len;
++	bool packet_peer_set;
+ };
+ 
+ /**
+@@ -127,17 +145,95 @@
+ CALLBACK(deliver_plain, void,
+ 	private_kernel_libipsec_router_t *this, ip_packet_t *packet)
+ {
+-	tun_device_t *tun;
+-	tun_entry_t *entry, lookup = {
+-		.addr = packet->get_destination(packet),
+-	};
++	if (this->no_tun)
++	{
++		chunk_t raw = packet->get_encoding(packet);
+ 
+-	this->lock->read_lock(this->lock);
+-	entry = this->tuns->get(this->tuns, &lookup);
+-	tun = entry ? entry->tun : this->tun.tun;
+-	tun->write_packet(tun, packet->get_encoding(packet));
++		this->lock->read_lock(this->lock);
++		if (this->packet_peer_set)
++		{
++			if (sendto(this->packet_fd, raw.ptr, raw.len, 0,
++					   (struct sockaddr*)&this->packet_peer,
++					   this->packet_peer_len) < 0)
++			{
++				DBG1(DBG_KNL, "sending plaintext packet to no-TUN peer failed: %s",
++					 strerror(errno));
++			}
++		}
++		else
++		{
++			DBG2(DBG_KNL, "no no-TUN packet peer registered, dropping plaintext packet");
++		}
++		this->lock->unlock(this->lock);
++		packet->destroy(packet);
++		return;
++	}
++
++	{
++		tun_device_t *tun;
++		tun_entry_t *entry, lookup = {
++			.addr = packet->get_destination(packet),
++		};
++
++		this->lock->read_lock(this->lock);
++		entry = this->tuns->get(this->tuns, &lookup);
++		tun = entry ? entry->tun : this->tun.tun;
++		tun->write_packet(tun, packet->get_encoding(packet));
++		this->lock->unlock(this->lock);
++		packet->destroy(packet);
++	}
++}
++
++/**
++ * Receive complete plaintext IP packets from an AF_UNIX datagram peer.
++ * The sender address is remembered so decrypted packets can be returned.
++ */
++static job_requeue_t handle_packet_socket(private_kernel_libipsec_router_t *this)
++{
++	uint8_t buf[65535];
++	struct sockaddr_un peer;
++	socklen_t peer_len = sizeof(peer);
++	ssize_t len;
++	bool oldstate;
++
++	oldstate = thread_cancelability(TRUE);
++	len = recvfrom(this->packet_fd, buf, sizeof(buf), 0,
++				   (struct sockaddr*)&peer, &peer_len);
++	thread_cancelability(oldstate);
++	if (len < 0)
++	{
++		if (errno != EINTR)
++		{
++			DBG1(DBG_KNL, "receiving no-TUN plaintext packet failed: %s",
++				 strerror(errno));
++		}
++		return JOB_REQUEUE_FAIR;
++	}
++	if (!len)
++	{
++		return JOB_REQUEUE_DIRECT;
++	}
++
++	this->lock->write_lock(this->lock);
++	memcpy(&this->packet_peer, &peer, peer_len);
++	this->packet_peer_len = peer_len;
++	this->packet_peer_set = TRUE;
+ 	this->lock->unlock(this->lock);
+-	packet->destroy(packet);
++
++	{
++		chunk_t raw = chunk_clone(chunk_create(buf, len));
++		ip_packet_t *packet = ip_packet_create(raw);
++
++		if (packet)
++		{
++			ipsec->processor->queue_outbound(ipsec->processor, packet);
++		}
++		else
++		{
++			DBG1(DBG_KNL, "invalid IP packet received from no-TUN packet socket");
++		}
++	}
++	return JOB_REQUEUE_DIRECT;
+ }
+ 
+ /**
+@@ -254,6 +350,11 @@
+ 	private_kernel_libipsec_router_t *this, tun_device_t *tun, bool created)
+ {
+ 	tun_entry_t *entry, lookup;
++
++	if (this->no_tun)
++	{
++		return TRUE;
++	}
+ 	char buf[] = {0x01};
+ 
+ 	this->lock->write_lock(this->lock);
+@@ -287,6 +388,10 @@
+ 	tun_device_t *tun;
+ 	char *name;
+ 
++	if (this->no_tun)
++	{
++		return strdup("notun");
++	}
+ 	if (!vip)
+ 	{
+ 		return strdup(this->tun.tun->get_name(this->tun.tun));
+@@ -305,11 +410,26 @@
+ 	charon->receiver->del_esp_cb(charon->receiver, receiver_esp_cb);
+ 	ipsec->processor->unregister_outbound(ipsec->processor, send_esp);
+ 	ipsec->processor->unregister_inbound(ipsec->processor, deliver_plain);
+-	charon->kernel->remove_listener(charon->kernel, &this->public.listener);
++	if (this->no_tun)
++	{
++		if (this->packet_fd >= 0)
++		{
++			close(this->packet_fd);
++		}
++		if (this->packet_path)
++		{
++			unlink(this->packet_path);
++			free(this->packet_path);
++		}
++	}
++	else
++	{
++		charon->kernel->remove_listener(charon->kernel, &this->public.listener);
++		close(this->notify[0]);
++		close(this->notify[1]);
++	}
+ 	this->lock->destroy(this->lock);
+ 	this->tuns->destroy(this->tuns);
+-	close(this->notify[0]);
+-	close(this->notify[1]);
+ 	router = NULL;
+ 	free(this);
+ }
+@@ -342,29 +462,75 @@
+ 			.tun = lib->get(lib, "kernel-libipsec-tun"),
+ 		},
+ 		.esp_handler = lib->get(lib, "kernel-libipsec-esp-handler"),
++		.no_tun = lib->settings->get_bool(lib->settings,
++									 "%s.plugins.kernel-libipsec.no_tun", FALSE, lib->ns),
++		.packet_fd = -1,
+ 	);
+ 
+-	if (pipe(this->notify) != 0 ||
+-		!set_nonblock(this->notify[0]) || !set_nonblock(this->notify[1]))
+-	{
+-		DBG1(DBG_KNL, "creating notify pipe for kernel-libipsec router failed");
+-		free(this);
+-		return NULL;
+-	}
+-
+-	this->tun.fd = this->tun.tun->get_fd(this->tun.tun);
+-
+ 	this->tuns = hashtable_create((hashtable_hash_t)tun_entry_hash,
+ 								  (hashtable_equals_t)tun_entry_equals, 4);
+ 	this->lock = rwlock_create(RWLOCK_TYPE_DEFAULT);
+ 
+-	charon->kernel->add_listener(charon->kernel, &this->public.listener);
++	if (this->no_tun)
++	{
++		const char *path = lib->settings->get_str(lib->settings,
++									 "%s.plugins.kernel-libipsec.packet_socket",
++									 "/run/strongswan-notun.sock", lib->ns);
++		struct sockaddr_un addr = { .sun_family = AF_UNIX };
++
++		if (strlen(path) >= sizeof(addr.sun_path))
++		{
++			DBG1(DBG_KNL, "no-TUN packet socket path too long: %s", path);
++			this->lock->destroy(this->lock);
++			this->tuns->destroy(this->tuns);
++			free(this);
++			return NULL;
++		}
++		this->packet_path = strdup(path);
++		strcpy(addr.sun_path, path);
++		unlink(path);
++		this->packet_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++		if (this->packet_fd < 0 ||
++			bind(this->packet_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
++			chmod(path, S_IRUSR | S_IWUSR) < 0)
++		{
++			DBG1(DBG_KNL, "creating no-TUN packet socket %s failed: %s",
++				 path, strerror(errno));
++			if (this->packet_fd >= 0)
++			{
++				close(this->packet_fd);
++			}
++			unlink(path);
++			free(this->packet_path);
++			this->lock->destroy(this->lock);
++			this->tuns->destroy(this->tuns);
++			free(this);
++			return NULL;
++		}
++		DBG1(DBG_KNL, "no-TUN plaintext packet socket ready at %s", path);
++	}
++	else
++	{
++		if (pipe(this->notify) != 0 ||
++			!set_nonblock(this->notify[0]) || !set_nonblock(this->notify[1]))
++		{
++			DBG1(DBG_KNL, "creating notify pipe for kernel-libipsec router failed");
++			this->lock->destroy(this->lock);
++			this->tuns->destroy(this->tuns);
++			free(this);
++			return NULL;
++		}
++		this->tun.fd = this->tun.tun->get_fd(this->tun.tun);
++		charon->kernel->add_listener(charon->kernel, &this->public.listener);
++	}
++
+ 	ipsec->processor->register_outbound(ipsec->processor, send_esp, this);
+ 	ipsec->processor->register_inbound(ipsec->processor, deliver_plain, this);
+ 	charon->receiver->add_esp_cb(charon->receiver, receiver_esp_cb, NULL);
+ 	lib->processor->queue_job(lib->processor,
+-			(job_t*)callback_job_create((callback_job_cb_t)handle_plain, this,
+-										NULL, callback_job_cancel_thread));
++			(job_t*)callback_job_create((callback_job_cb_t)
++				(this->no_tun ? handle_packet_socket : handle_plain), this,
++				NULL, callback_job_cancel_thread));
+ 
+ 	router = &this->public;
+ 	return &this->public;
